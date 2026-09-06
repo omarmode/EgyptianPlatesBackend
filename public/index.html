@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>لوحة التحكم — نظام إدارة التراخيص</title>
+  <style>
+    :root {
+      --bg: #0b1120;
+      --panel: #131c31;
+      --panel-2: #1b2740;
+      --border: #263353;
+      --text: #e7ecf5;
+      --muted: #8fa0c0;
+      --accent: #4f8cff;
+      --green: #22c55e;
+      --red: #ef4444;
+      --amber: #f59e0b;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Tahoma", system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 80% -10%, #1a2540, transparent), var(--bg);
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 18px 28px; border-bottom: 1px solid var(--border);
+      background: rgba(19,28,49,0.7); backdrop-filter: blur(6px);
+      position: sticky; top: 0; z-index: 10;
+    }
+    header h1 { font-size: 20px; margin: 0; display: flex; align-items: center; gap: 10px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+    .dot.on { background: var(--green); box-shadow: 0 0 10px var(--green); }
+    .dot.off { background: var(--red); box-shadow: 0 0 10px var(--red); }
+    main { max-width: 1200px; margin: 0 auto; padding: 26px; display: grid; gap: 22px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px;
+    }
+    .card h2 { margin: 0 0 14px; font-size: 16px; color: var(--text); }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 6px; }
+    input, select {
+      width: 100%; padding: 11px 13px; border-radius: 10px;
+      border: 1px solid var(--border); background: var(--panel-2);
+      color: var(--text); font-size: 14px; font-family: inherit;
+    }
+    input:focus, select:focus { outline: none; border-color: var(--accent); }
+    button {
+      cursor: pointer; border: none; border-radius: 10px; padding: 11px 16px;
+      font-size: 14px; font-weight: 600; font-family: inherit; color: #fff;
+      background: var(--accent); transition: opacity .15s, transform .05s;
+    }
+    button:hover { opacity: .9; }
+    button:active { transform: translateY(1px); }
+    button.gray { background: var(--panel-2); border: 1px solid var(--border); }
+    button.green { background: var(--green); }
+    button.red { background: var(--red); }
+    button.amber { background: var(--amber); color: #1b1400; }
+    .row { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+    .row > * { flex: 1; }
+    .muted { color: var(--muted); font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: right; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    .badge { padding: 3px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; display: inline-block; }
+    .badge.ok { background: rgba(34,197,94,.15); color: var(--green); }
+    .badge.bad { background: rgba(239,68,68,.15); color: var(--red); }
+    .killbox { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .status-pill { font-size: 15px; font-weight: 700; padding: 8px 16px; border-radius: 999px; }
+    .status-pill.on { background: rgba(34,197,94,.15); color: var(--green); }
+    .status-pill.off { background: rgba(239,68,68,.15); color: var(--red); }
+    .code-out {
+      margin-top: 12px; padding: 12px; border-radius: 10px; background: #0d1424;
+      border: 1px dashed var(--accent); font-family: monospace; font-size: 18px;
+      letter-spacing: 1px; display: none; align-items: center; justify-content: space-between; gap: 10px;
+    }
+    .toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+      padding: 12px 20px; border-radius: 12px; opacity: 0; transition: opacity .25s, bottom .25s;
+      pointer-events: none; z-index: 50; font-size: 14px;
+    }
+    .toast.show { opacity: 1; bottom: 34px; }
+    .toast.err { border-color: var(--red); }
+    a { color: var(--accent); }
+    .tbl-actions { display: flex; gap: 6px; }
+    .tbl-actions button { padding: 6px 10px; font-size: 12px; }
+    .refresh { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 6px 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span id="statusDot" class="dot"></span> لوحة تحكم نظام التراخيص</h1>
+    <span class="muted" id="connState">غير متصل</span>
+  </header>
+
+  <main>
+    <!-- Auth -->
+    <div class="card">
+      <h2>مفتاح المدير (Admin API Key)</h2>
+      <div class="row">
+        <div style="flex: 3;">
+          <label>أدخل مفتاح ADMIN_API_KEY (يُحفظ في متصفحك فقط)</label>
+          <input id="adminKey" type="password" placeholder="ADMIN_API_KEY" />
+        </div>
+        <button id="saveKeyBtn">حفظ واتصال</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- Kill switch -->
+      <div class="card">
+        <h2>مفتاح الإيقاف العام (Master Kill-Switch)</h2>
+        <div class="killbox">
+          <span id="killPill" class="status-pill off">—</span>
+          <button id="killBtn" class="green">تشغيل / إيقاف</button>
+        </div>
+        <label>رسالة الإيقاف (تظهر للأجهزة عند الإيقاف)</label>
+        <input id="killMsg" placeholder="مثال: النظام متوقف للصيانة" />
+      </div>
+
+      <!-- Create license -->
+      <div class="card">
+        <h2>توليد كود تفعيل جديد</h2>
+        <div class="row">
+          <div>
+            <label>عدد أيام الصلاحية</label>
+            <input id="durDays" type="number" value="30" min="1" />
+          </div>
+          <button id="createBtn" class="green">إنشاء كود</button>
+        </div>
+        <div id="codeOut" class="code-out">
+          <span id="codeText"></span>
+          <button id="copyBtn" class="gray">نسخ</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Devices -->
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h2>الأجهزة النشطة</h2>
+        <button class="refresh" id="refreshDevices">تحديث</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>معرّف الجهاز</th><th>الاسم</th><th>الكود</th><th>الحالة</th><th>آخر ظهور</th><th>إجراء</th></tr>
+        </thead>
+        <tbody id="devicesBody"><tr><td colspan="6" class="muted">— لا بيانات —</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- Locations -->
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h2>اللوحات المرصودة</h2>
+        <button class="refresh" id="refreshLocations">تحديث</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>رقم اللوحة</th><th>المكان</th><th>الإحداثيات</th><th>الجهاز</th><th>الوقت</th><th>الخريطة</th></tr>
+        </thead>
+        <tbody id="locationsBody"><tr><td colspan="6" class="muted">— لا بيانات —</td></tr></tbody>
+      </table>
+    </div>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let ADMIN_KEY = localStorage.getItem('ADMIN_API_KEY') || '';
+    $('adminKey').value = ADMIN_KEY;
+
+    function toast(msg, isErr) {
+      const t = $('toast');
+      t.textContent = msg;
+      t.className = 'toast show' + (isErr ? ' err' : '');
+      setTimeout(() => (t.className = 'toast'), 2600);
+    }
+
+    async function api(pathname, method = 'GET', body) {
+      const res = await fetch(pathname, {
+        method,
+        headers: { 'Content-Type': 'application/json', 'x-admin-key': ADMIN_KEY },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || ('خطأ ' + res.status));
+      return data;
+    }
+
+    function setConn(ok) {
+      $('statusDot').className = 'dot ' + (ok ? 'on' : 'off');
+      $('connState').textContent = ok ? 'متصل' : 'غير متصل';
+    }
+
+    // ---- Kill switch ----
+    let systemEnabled = null;
+    function renderKill(enabled, message) {
+      systemEnabled = enabled;
+      const pill = $('killPill');
+      pill.textContent = enabled ? 'النظام يعمل' : 'النظام متوقف';
+      pill.className = 'status-pill ' + (enabled ? 'on' : 'off');
+      const btn = $('killBtn');
+      btn.textContent = enabled ? 'إيقاف النظام بالكامل' : 'تشغيل النظام';
+      btn.className = enabled ? 'red' : 'green';
+      if (message != null) $('killMsg').value = message || '';
+    }
+
+    async function loadSystem() {
+      const d = await api('/api/admin/system');
+      renderKill(d.system.is_system_enabled, d.system.admin_message);
+    }
+
+    $('killBtn').onclick = async () => {
+      try {
+        const d = await api('/api/admin/system/killswitch', 'POST', {
+          is_system_enabled: !systemEnabled,
+          admin_message: $('killMsg').value || null,
+        });
+        renderKill(d.system.is_system_enabled, d.system.admin_message);
+        toast(systemEnabled ? 'تم تشغيل النظام' : 'تم إيقاف النظام');
+      } catch (e) { toast(e.message, true); }
+    };
+
+    // ---- Create license ----
+    $('createBtn').onclick = async () => {
+      try {
+        const days = parseInt($('durDays').value, 10) || 30;
+        const d = await api('/api/admin/license/create', 'POST', { duration_days: days });
+        $('codeOut').style.display = 'flex';
+        $('codeText').textContent = d.license.code;
+        toast('تم إنشاء الكود');
+      } catch (e) { toast(e.message, true); }
+    };
+    $('copyBtn').onclick = () => {
+      navigator.clipboard.writeText($('codeText').textContent);
+      toast('تم النسخ');
+    };
+
+    // ---- Devices ----
+    async function loadDevices() {
+      try {
+        const d = await api('/api/admin/devices');
+        const body = $('devicesBody');
+        if (!d.devices.length) { body.innerHTML = '<tr><td colspan="6" class="muted">— لا أجهزة —</td></tr>'; return; }
+        body.innerHTML = d.devices.map((s) => `
+          <tr>
+            <td>${esc(s.device_id)}</td>
+            <td>${esc(s.device_name || '-')}</td>
+            <td>${esc(s.license_code || '-')}</td>
+            <td>${s.is_revoked ? '<span class="badge bad">مطرود</span>' : '<span class="badge ok">نشط</span>'}</td>
+            <td>${fmt(s.last_seen_at)}</td>
+            <td class="tbl-actions">
+              ${s.is_revoked
+                ? `<button class="green" onclick="unrevoke('${esc(s.device_id)}')">فك الطرد</button>`
+                : `<button class="red" onclick="revoke('${esc(s.device_id)}')">طرد</button>`}
+            </td>
+          </tr>`).join('');
+      } catch (e) { toast(e.message, true); }
+    }
+    window.revoke = async (id) => { try { await api('/api/admin/device/revoke', 'POST', { device_id: id }); toast('تم طرد الجهاز'); loadDevices(); } catch (e) { toast(e.message, true); } };
+    window.unrevoke = async (id) => { try { await api('/api/admin/device/unrevoke', 'POST', { device_id: id }); toast('تم فك الطرد'); loadDevices(); } catch (e) { toast(e.message, true); } };
+
+    // ---- Locations ----
+    async function loadLocations() {
+      try {
+        const d = await api('/api/admin/locations');
+        const body = $('locationsBody');
+        if (!d.locations.length) { body.innerHTML = '<tr><td colspan="6" class="muted">— لا مواقع —</td></tr>'; return; }
+        body.innerHTML = d.locations.map((l) => {
+          const hasGeo = l.latitude != null && l.longitude != null;
+          const maps = hasGeo ? `https://www.google.com/maps?q=${l.latitude},${l.longitude}` : null;
+          return `<tr>
+            <td><b>${esc(l.plate_number)}</b></td>
+            <td>${esc(l.place_name || '-')}</td>
+            <td>${hasGeo ? `${l.latitude}, ${l.longitude}` : '-'}</td>
+            <td>${esc(l.device_id || '-')}</td>
+            <td>${fmt(l.created_at)}</td>
+            <td>${maps ? `<a href="${maps}" target="_blank">عرض الموقع</a>` : '-'}</td>
+          </tr>`;
+        }).join('');
+      } catch (e) { toast(e.message, true); }
+    }
+
+    // ---- helpers ----
+    function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+    function fmt(t) { if (!t) return '-'; const d = new Date(t); return d.toLocaleString('ar-EG'); }
+
+    async function refreshAll() {
+      try {
+        await loadSystem();
+        setConn(true);
+        await Promise.all([loadDevices(), loadLocations()]);
+      } catch (e) {
+        setConn(false);
+        toast('فشل الاتصال: ' + e.message, true);
+      }
+    }
+
+    $('saveKeyBtn').onclick = () => {
+      ADMIN_KEY = $('adminKey').value.trim();
+      localStorage.setItem('ADMIN_API_KEY', ADMIN_KEY);
+      refreshAll();
+    };
+    $('refreshDevices').onclick = loadDevices;
+    $('refreshLocations').onclick = loadLocations;
+
+    // auto-connect if key already saved
+    if (ADMIN_KEY) refreshAll();
+
+    // periodic refresh
+    setInterval(() => { if (ADMIN_KEY && systemEnabled !== null) { loadDevices(); loadLocations(); } }, 15000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+node_modules/
+.env
+*.log
+_moved_from_frontend/
+.DS_Store
