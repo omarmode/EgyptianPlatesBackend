@@ -325,10 +325,18 @@ app.post('/api/session/status', enforceKillSwitch, async (req, res) => {
 });
 
 // POST /api/location/save
-// Body: { plate_number, latitude?, longitude?, place_name?, device_id?, detected_by_user? }
+// Body: { plate_number, vehicle_type?, latitude?, longitude?, place_name?, device_id?, detected_by_user? }
 app.post('/api/location/save', enforceKillSwitch, async (req, res) => {
   try {
-    const { plate_number, latitude, longitude, place_name, device_id, detected_by_user } = req.body || {};
+    const {
+      plate_number,
+      vehicle_type,
+      latitude,
+      longitude,
+      place_name,
+      device_id,
+      detected_by_user,
+    } = req.body || {};
     if (!plate_number) return res.status(400).json({ ok: false, code: 'BAD_REQUEST', message: 'plate_number is required.' });
 
     if (device_id) {
@@ -339,18 +347,28 @@ app.post('/api/location/save', enforceKillSwitch, async (req, res) => {
       }
     }
 
-    const { data, error } = await supabase
+    const locationPayload = {
+      plate_number,
+      vehicle_type: vehicle_type ?? null,
+      latitude: latitude ?? null,
+      longitude: longitude ?? null,
+      place_name: place_name ?? null,
+      device_id: device_id ?? null,
+      detected_by_user: detected_by_user ?? null,
+    };
+    let { data, error } = await supabase
       .from('detected_locations')
-      .insert({
-        plate_number,
-        latitude: latitude ?? null,
-        longitude: longitude ?? null,
-        place_name: place_name ?? null,
-        device_id: device_id ?? null,
-        detected_by_user: detected_by_user ?? null,
-      })
+      .insert(locationPayload)
       .select()
       .single();
+    if (error && /vehicle_type/i.test(error.message || '')) {
+      const { vehicle_type: _ignoredVehicleType, ...legacyPayload } = locationPayload;
+      ({ data, error } = await supabase
+        .from('detected_locations')
+        .insert(legacyPayload)
+        .select()
+        .single());
+    }
     if (error) throw error;
 
     res.status(201).json({ ok: true, code: 'SAVED', location: data });
@@ -579,6 +597,7 @@ app.post('/api/plates/log', enforceKillSwitch, async (req, res) => {
   try {
     const {
       plate_number,
+      vehicle_type,
       latitude,
       longitude,
       place_name,
@@ -592,24 +611,35 @@ app.post('/api/plates/log', enforceKillSwitch, async (req, res) => {
       return res.status(400).json({ ok: false, code: 'BAD_REQUEST', message: 'plate_number is required.' });
     }
     const uid = (user_email || detected_by_user || '').toString().toLowerCase() || null;
-    const { data, error } = await supabase
+    const platePayload = {
+      plate_number,
+      vehicle_type: vehicle_type ?? null,
+      latitude: latitude ?? null,
+      longitude: longitude ?? null,
+      place_name: place_name ?? null,
+      device_id: device_id ?? null,
+      detected_by_user: uid,
+    };
+    let { data, error } = await supabase
       .from('detected_locations')
-      .insert({
-        plate_number,
-        latitude: latitude ?? null,
-        longitude: longitude ?? null,
-        place_name: place_name ?? null,
-        device_id: device_id ?? null,
-        detected_by_user: uid,
-      })
+      .insert(platePayload)
       .select()
       .single();
+    if (error && /vehicle_type/i.test(error.message || '')) {
+      const { vehicle_type: _ignoredVehicleType, ...legacyPayload } = platePayload;
+      ({ data, error } = await supabase
+        .from('detected_locations')
+        .insert(legacyPayload)
+        .select()
+        .single());
+    }
     if (error) throw error;
     res.status(201).json({
       ok: true,
       code: 'LOGGED',
       plate: {
         ...data,
+        vehicle_type: data.vehicle_type || vehicle_type || null,
         letters: letters || null,
         detected_at: detected_at || data.created_at,
         user_email: uid,
