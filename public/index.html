@@ -131,8 +131,21 @@
         <h2>توليد كود تفعيل جديد</h2>
         <div class="row">
           <div>
-            <label>عدد أيام الصلاحية</label>
+            <label>نوع المدة</label>
+            <select id="durUnit">
+              <option value="days">يوم / أيام</option>
+              <option value="hours">ساعات</option>
+              <option value="months">شهر / أشهر</option>
+              <option value="custom">تاريخ انتهاء مخصص</option>
+            </select>
+          </div>
+          <div>
+            <label>القيمة</label>
             <input id="durDays" type="number" value="30" min="1" />
+          </div>
+          <div>
+            <label>تاريخ الانتهاء (للمخصص)</label>
+            <input id="durCustom" type="datetime-local" />
           </div>
           <button id="createBtn" class="green">إنشاء كود</button>
         </div>
@@ -234,8 +247,17 @@
     // ---- Create license ----
     $('createBtn').onclick = async () => {
       try {
-        const days = parseInt($('durDays').value, 10) || 30;
-        const d = await api('/api/admin/license/create', 'POST', { duration_days: days });
+        const unit = $('durUnit').value;
+        const value = parseInt($('durDays').value, 10) || 1;
+        const body = { unit };
+        if (unit === 'hours') body.duration_hours = value;
+        else if (unit === 'months') body.duration_months = value;
+        else if (unit === 'custom') {
+          const raw = $('durCustom').value;
+          if (!raw) throw new Error('حدد تاريخ الانتهاء');
+          body.expires_at = new Date(raw).toISOString();
+        } else body.duration_days = value;
+        const d = await api('/api/admin/license/create', 'POST', body);
         $('codeOut').style.display = 'flex';
         $('codeText').textContent = d.license.code;
         toast('تم إنشاء الكود');

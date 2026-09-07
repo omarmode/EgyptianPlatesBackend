@@ -31,10 +31,43 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const { supabase } = require('./db');
+const {
+  resolveLicenseDuration,
+  computeExpiryAt,
+  licenseStatusPayload,
+} = require('./lib/licenseTiming');
+const { verifyGoogleBearer } = require('./lib/googleAuth');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+const DEFAULT_ORIGINS = [
+  'https://egyptianplatesbackend.onrender.com',
+  'https://cpedlqwpzpvpwydeocbc.supabase.co',
+  'http://localhost:3000',
+  'http://localhost:8081',
+  'http://localhost:19006',
+];
+const CORS_ORIGINS = [
+  ...DEFAULT_ORIGINS,
+  process.env.FRONTEND_ORIGIN,
+  ...(process.env.CORS_ORIGINS || '').split(','),
+]
+  .map((value) => String(value || '').trim().replace(/\/$/, ''))
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    const normalized = origin.replace(/\/$/, '');
+    if (CORS_ORIGINS.includes(normalized)) return callback(null, true);
+    if (/^egyptianplates:/i.test(origin)) return callback(null, true);
+    if (/^exp:\/\//i.test(origin)) return callback(null, true);
+    return callback(null, false);
+  },
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key'],
+}));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
 
 // Serve the (legacy) web dashboard from ./public — still works via x-admin-key.
 app.use(express.static(path.join(__dirname, 'public')));
@@ -95,15 +128,22 @@ async function authenticate(req) {
   }
   const token = authz.slice(7).trim();
   const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data || !data.user) {
-    const err = new Error('Invalid or expired token.');
-    err.status = 401;
-    err.code = 'INVALID_TOKEN';
-    throw err;
+  if (!error && data?.user?.email) {
+    const email = data.user.email;
+    const role = await resolveRole(email);
+    return { id: data.user.id, email, role, via: 'supabase' };
   }
-  const email = data.user.email;
-  const role = await resolveRole(email);
-  return { id: data.user.id, email, role, via: 'supabase' };
+
+  const googleUser = await verifyGoogleBearer(token);
+  if (googleUser?.email) {
+    const role = await resolveRole(googleUser.email);
+    return { id: googleUser.sub || null, email: googleUser.email, role, via: googleUser.via };
+  }
+
+  const err = new Error('Invalid or expired token.');
+  err.status = 401;
+  err.code = 'INVALID_TOKEN';
+  throw err;
 }
 
 // Middleware factory: authenticate then require one of the allowed roles.
@@ -170,6 +210,41 @@ function generateLicenseCode() {
   return raw.match(/.{1,4}/g).join('-');
 }
 
+async function insertLicenseRow(row) {
+  let { data, error } = await supabase.from('licenses').insert(row).select().single();
+  if (error && /duration_hours|duration_months|duration_unit/i.test(error.message || '')) {
+    const {
+      duration_hours: _h,
+      duration_months: _m,
+      duration_unit: _u,
+      ...legacy
+    } = row;
+    ({ data, error } = await supabase.from('licenses').insert(legacy).select().single());
+  }
+  if (error) throw error;
+  return data;
+}
+
+const BULK_CHUNK_SIZE = Math.min(
+  5000,
+  Math.max(500, Number(process.env.BULK_UPSERT_CHUNK_SIZE) || 2500),
+);
+
+function normalizeWatchlistRow(row) {
+  const plate = String(
+    row?.plate_number || row?.display || row?.plate || row?.لوحة || '',
+  ).trim();
+  if (!plate) return null;
+  return {
+    plate_number: plate,
+    letters: row.letters || row.الحروف || null,
+    numbers: row.numbers != null ? String(row.numbers) : (row.الأرقام || null),
+    vehicle_type: row.vehicle_type || row.vehicleType || row.النوع || null,
+    vin: row.vin || row.vinLast4 || row.الشاص || row.الهيكل || null,
+    notes: row.notes || row.سبب || row.reason || null,
+  };
+}
+
 // ===========================================================================
 // Health + auth info
 // ===========================================================================
@@ -177,7 +252,26 @@ app.get('/health', (req, res) => res.json({ ok: true, service: 'EgyptianPlatesBa
 
 // GET /api/auth/me -> who am I + my role (used by the app after Google login).
 app.get('/api/auth/me', requireAuth, (req, res) => {
-  res.json({ ok: true, user: { email: req.user.email, role: req.user.role } });
+  res.json({ ok: true, user: { email: req.user.email, role: req.user.role, via: req.user.via } });
+});
+
+// POST /api/auth/google  Body: { id_token? | access_token? }
+// Browser Google OAuth: verify token, then resolve Super Admin / Admin / user.
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const token = req.body?.id_token || req.body?.access_token || req.body?.credential;
+    const googleUser = await verifyGoogleBearer(token);
+    if (!googleUser?.email) {
+      return res.status(401).json({ ok: false, code: 'INVALID_GOOGLE_TOKEN', message: 'Google token is invalid or email is unverified.' });
+    }
+    const role = await resolveRole(googleUser.email);
+    return res.json({
+      ok: true,
+      user: { email: googleUser.email, role, via: googleUser.via },
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
+  }
 });
 
 // ===========================================================================
@@ -209,11 +303,19 @@ app.post('/api/license/verify', enforceKillSwitch, async (req, res) => {
     }
 
     let updatedLicense = license;
-    if (!license.bound_device_id || (email && license.bound_user_email !== email) || license.bound_device_id !== device_id) {
+    const alreadyBound = !!license.bound_device_id;
+    const shouldBind = !alreadyBound
+      || (email && license.bound_user_email !== email)
+      || license.bound_device_id !== device_id;
+
+    if (shouldBind) {
       const now = new Date();
-      const expires = license.expires_at
+      const keepCustomExpiry = license.duration_unit === 'custom' && license.expires_at;
+      const expires = keepCustomExpiry
         ? new Date(license.expires_at)
-        : new Date(now.getTime() + license.duration_days * 24 * 60 * 60 * 1000);
+        : (license.expires_at && alreadyBound
+          ? new Date(license.expires_at)
+          : computeExpiryAt(license, now));
       const patch = {
         bound_device_id: device_id,
         bound_device_name: device_name || license.bound_device_name || null,
@@ -233,26 +335,26 @@ app.post('/api/license/verify', enforceKillSwitch, async (req, res) => {
       updatedLicense = data;
     }
 
-    const expired = updatedLicense.expires_at && new Date(updatedLicense.expires_at) < new Date();
+    const view = licenseStatusPayload(updatedLicense, { email });
     await upsertSession({ device_id, license_code: code, device_name });
 
-    if (expired) {
-      return res.status(403).json({ ok: false, code: 'EXPIRED', message: 'This license has expired.', expires_at: updatedLicense.expires_at });
+    if (view.status === 'expired') {
+      return res.status(403).json({
+        ok: false,
+        code: 'EXPIRED',
+        message: 'This license has expired.',
+        expires_at: view.expires_at,
+        remaining_minutes: 0,
+        remaining_hours: 0,
+        license: view,
+      });
     }
 
     return res.json({
       ok: true,
       code: 'ACTIVATED',
       message: 'License is valid for this device.',
-      license: {
-        code: updatedLicense.code,
-        bound_device_id: updatedLicense.bound_device_id,
-        bound_user_email: updatedLicense.bound_user_email || email,
-        first_used_at: updatedLicense.first_used_at,
-        expires_at: updatedLicense.expires_at,
-        duration_days: updatedLicense.duration_days,
-        is_active: updatedLicense.is_active,
-      },
+      license: view,
     });
   } catch (err) {
     console.error('[verify] error:', err.message);
@@ -280,14 +382,14 @@ app.post('/api/license/status', enforceKillSwitch, async (req, res) => {
     if (!license) {
       return res.json({ ok: true, valid: false, code: 'NO_LICENSE', message: 'No active license found.' });
     }
+    const view = licenseStatusPayload(license);
     if (!license.is_active) {
-      return res.json({ ok: true, valid: false, code: 'CODE_DISABLED', message: 'License is deactivated.', license });
+      return res.json({ ok: true, valid: false, code: 'CODE_DISABLED', message: 'License is deactivated.', license: view });
     }
-    const expired = license.expires_at && new Date(license.expires_at) < new Date();
-    if (expired) {
-      return res.json({ ok: true, valid: false, code: 'EXPIRED', message: 'License expired.', license });
+    if (view.status === 'expired') {
+      return res.json({ ok: true, valid: false, code: 'EXPIRED', message: 'License expired.', license: view });
     }
-    return res.json({ ok: true, valid: true, code: 'ACTIVE', license });
+    return res.json({ ok: true, valid: true, code: 'ACTIVE', license: view });
   } catch (err) {
     console.error('[license/status] error:', err.message);
     res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
@@ -310,10 +412,15 @@ app.post('/api/session/status', enforceKillSwitch, async (req, res) => {
       const { data: lic } = await supabase
         .from('licenses').select('code, is_active, expires_at, bound_device_id').eq('code', session.license_code).maybeSingle();
       if (lic) {
-        const expired = lic.expires_at && new Date(lic.expires_at) < new Date();
-        licenseInfo = { code: lic.code, is_active: lic.is_active, expires_at: lic.expires_at, expired };
-        if (!lic.is_active || expired) {
-          return res.status(403).json({ ok: false, code: 'EXPIRED', message: 'License is inactive or expired.', license: licenseInfo });
+        const view = licenseStatusPayload(lic);
+        licenseInfo = view;
+        if (!lic.is_active || view.status === 'expired') {
+          return res.status(403).json({
+            ok: false,
+            code: view.status === 'expired' ? 'EXPIRED' : 'CODE_DISABLED',
+            message: 'License is inactive or expired.',
+            license: licenseInfo,
+          });
         }
       }
     }
@@ -382,8 +489,9 @@ app.post('/api/location/save', enforceKillSwitch, async (req, res) => {
 // ADMIN ROUTES (admin + superadmin)
 // ===========================================================================
 
-// POST /api/admin/license/create  Body: { duration_days?, code? }
-// Regular admins are blocked when the super admin froze code generation.
+// POST /api/admin/license/create
+// Body: { duration_days? } (legacy mobile)
+//        { duration_hours? | duration_months? | expires_at? | unit? | code? }
 app.post('/api/admin/license/create', requireAdmin, async (req, res) => {
   try {
     if (req.user.role === 'admin') {
@@ -397,18 +505,21 @@ app.post('/api/admin/license/create', requireAdmin, async (req, res) => {
       }
     }
 
-    const { duration_days, code } = req.body || {};
+    const { code } = req.body || {};
     const newCode = code || generateLicenseCode();
-    const days = Number.isInteger(duration_days) && duration_days > 0 ? duration_days : 30;
+    const duration = resolveLicenseDuration(req.body || {});
+    const row = {
+      code: newCode,
+      duration_days: duration.duration_days,
+      issued_by: req.user.email,
+      duration_hours: duration.duration_hours,
+      duration_months: duration.duration_months,
+      duration_unit: duration.duration_unit,
+    };
+    if (duration.expires_at) row.expires_at = duration.expires_at;
 
-    const { data, error } = await supabase
-      .from('licenses')
-      .insert({ code: newCode, duration_days: days, issued_by: req.user.email })
-      .select()
-      .single();
-    if (error) throw error;
-
-    res.status(201).json({ ok: true, code: 'CREATED', license: data });
+    const data = await insertLicenseRow(row);
+    res.status(201).json({ ok: true, code: 'CREATED', license: licenseStatusPayload(data) });
   } catch (err) {
     console.error('[admin/create] error:', err.message);
     res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
@@ -428,9 +539,30 @@ app.post('/api/admin/license/deactivate', requireAdmin, async (req, res) => {
       .maybeSingle();
     if (error) throw error;
     if (!data) return res.status(404).json({ ok: false, code: 'NOT_FOUND', message: 'License not found.' });
-    res.json({ ok: true, code: 'DEACTIVATED', license: data });
+    res.json({ ok: true, code: 'DEACTIVATED', license: licenseStatusPayload(data) });
   } catch (err) {
     console.error('[admin/deactivate] error:', err.message);
+    res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
+  }
+});
+
+// POST /api/admin/license/revoke — freeze a code immediately (alias of deactivate)
+app.post('/api/admin/license/revoke', requireAdmin, async (req, res) => {
+  req.url = '/api/admin/license/deactivate';
+  try {
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ ok: false, code: 'BAD_REQUEST', message: 'code is required.' });
+    const { data, error } = await supabase
+      .from('licenses')
+      .update({ is_active: false })
+      .eq('code', code)
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ ok: false, code: 'NOT_FOUND', message: 'License not found.' });
+    res.json({ ok: true, code: 'REVOKED', license: licenseStatusPayload(data) });
+  } catch (err) {
+    console.error('[admin/revoke] error:', err.message);
     res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
   }
 });
@@ -485,7 +617,7 @@ app.get('/api/admin/system', requireAdmin, async (req, res) => {
 app.get('/api/admin/licenses', requireAdmin, async (req, res) => {
   const { data, error } = await supabase.from('licenses').select('*').order('created_at', { ascending: false });
   if (error) return res.status(500).json({ ok: false, message: error.message });
-  res.json({ ok: true, licenses: data });
+  res.json({ ok: true, licenses: (data || []).map((row) => ({ ...row, ...licenseStatusPayload(row) })) });
 });
 app.get('/api/admin/devices', requireAdmin, async (req, res) => {
   const { data, error } = await supabase.from('device_sessions').select('*').order('last_seen_at', { ascending: false });
@@ -680,6 +812,71 @@ app.get('/api/plates/daily', enforceKillSwitch, async (req, res) => {
   }
 });
 
+// POST /api/plates/bulk-import
+// Body: { plates: [...] } or { rows: [...] }
+// Chunked upsert into watchlist_plates so large Excel dumps finish in seconds.
+app.post('/api/plates/bulk-import', requireAdmin, async (req, res) => {
+  const started = Date.now();
+  try {
+    const raw = req.body?.plates || req.body?.rows || req.body?.entries || [];
+    if (!Array.isArray(raw) || raw.length === 0) {
+      return res.status(400).json({ ok: false, code: 'BAD_REQUEST', message: 'plates array is required.' });
+    }
+
+    const byPlate = new Map();
+    raw.forEach((item) => {
+      const row = normalizeWatchlistRow(item);
+      if (!row) return;
+      byPlate.set(row.plate_number, {
+        ...row,
+        imported_by: req.user.email,
+        updated_at: new Date().toISOString(),
+      });
+    });
+    const unique = Array.from(byPlate.values());
+    if (!unique.length) {
+      return res.status(400).json({ ok: false, code: 'BAD_REQUEST', message: 'No valid plate_number values found.' });
+    }
+
+    let upserted = 0;
+    const errors = [];
+    for (let i = 0; i < unique.length; i += BULK_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + BULK_CHUNK_SIZE);
+      const { error } = await supabase
+        .from('watchlist_plates')
+        .upsert(chunk, { onConflict: 'plate_number' });
+      if (error) {
+        errors.push({ offset: i, message: error.message });
+        break;
+      }
+      upserted += chunk.length;
+    }
+
+    if (errors.length && upserted === 0) {
+      return res.status(500).json({
+        ok: false,
+        code: 'UPSERT_FAILED',
+        message: errors[0].message,
+        hint: 'Run migrations/20260907_license_duration_and_watchlist.sql on Supabase first.',
+      });
+    }
+
+    res.json({
+      ok: true,
+      code: 'IMPORTED',
+      received: raw.length,
+      unique: unique.length,
+      upserted,
+      chunk_size: BULK_CHUNK_SIZE,
+      elapsed_ms: Date.now() - started,
+      errors: errors.length ? errors : undefined,
+    });
+  } catch (err) {
+    console.error('[plates/bulk-import] error:', err.message);
+    res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
+  }
+});
+
 // Aliases requested by client contract
 app.post('/api/admin/kill-switch', requireSuperAdmin, async (req, res) => {
   req.url = '/api/superadmin/killswitch';
@@ -734,7 +931,7 @@ app.patch('/api/admin/licenses/:id/revoke', requireAdmin, async (req, res) => {
     const { data, error } = await q;
     if (error) throw error;
     if (!data) return res.status(404).json({ ok: false, code: 'NOT_FOUND', message: 'License not found.' });
-    res.json({ ok: true, code: 'REVOKED', license: data });
+    res.json({ ok: true, code: 'REVOKED', license: licenseStatusPayload(data) });
   } catch (err) {
     res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
   }
@@ -761,4 +958,5 @@ app.use((req, res) => res.status(404).json({ ok: false, code: 'NOT_FOUND', messa
 app.listen(PORT, () => {
   console.log(`EgyptianPlatesBackend listening on http://localhost:${PORT}`);
   console.log(`Super admin: ${SUPER_ADMIN_EMAIL}`);
+  console.log(`CORS origins: ${CORS_ORIGINS.join(', ')}`);
 });
