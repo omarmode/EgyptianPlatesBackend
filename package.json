@@ -6,7 +6,9 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "verify:watchlist": "node scripts/verify-watchlist-contract.js",
+    "seed:admins": "node scripts/seed-admin-accounts.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",

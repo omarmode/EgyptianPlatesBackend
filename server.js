@@ -37,6 +37,11 @@ const {
   licenseStatusPayload,
 } = require('./lib/licenseTiming');
 const { verifyGoogleBearer } = require('./lib/googleAuth');
+const {
+  handleWatchlistImportChunk,
+  mapWatchlistError,
+  normalizeWatchlistRow,
+} = require('./lib/watchlistImport');
 
 const app = express();
 
@@ -68,6 +73,16 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key'],
 }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
+app.use((err, req, res, next) => {
+  if (err?.type === 'entity.too.large' || err?.status === 413) {
+    return res.status(413).json({
+      ok: false,
+      code: 'PAYLOAD_TOO_LARGE',
+      message: 'Chunk payload exceeds the JSON body limit.',
+    });
+  }
+  return next(err);
+});
 
 // Serve the (legacy) web dashboard from ./public — still works via x-admin-key.
 app.use(express.static(path.join(__dirname, 'public')));
@@ -96,11 +111,13 @@ async function getSystemControl() {
 }
 
 // Decide a role from an email address.
-async function resolveRole(email) {
+async function resolveRole(email, appMetadata) {
   if (!email) return 'user';
   const e = email.toLowerCase();
   if (e === SUPER_ADMIN_EMAIL) return 'superadmin';
   if (ENV_ADMIN_EMAILS.includes(e)) return 'admin';
+  const metaRole = String(appMetadata?.role || '').trim().toLowerCase();
+  if (metaRole === 'superadmin' || metaRole === 'admin') return metaRole;
   const { data } = await supabase
     .from('admin_users')
     .select('is_active')
@@ -130,7 +147,7 @@ async function authenticate(req) {
   const { data, error } = await supabase.auth.getUser(token);
   if (!error && data?.user?.email) {
     const email = data.user.email;
-    const role = await resolveRole(email);
+    const role = await resolveRole(email, data.user.app_metadata);
     return { id: data.user.id, email, role, via: 'supabase' };
   }
 
@@ -230,19 +247,47 @@ const BULK_CHUNK_SIZE = Math.min(
   Math.max(500, Number(process.env.BULK_UPSERT_CHUNK_SIZE) || 2500),
 );
 
-function normalizeWatchlistRow(row) {
-  const plate = String(
-    row?.plate_number || row?.display || row?.plate || row?.لوحة || '',
-  ).trim();
-  if (!plate) return null;
-  return {
-    plate_number: plate,
-    letters: row.letters || row.الحروف || null,
-    numbers: row.numbers != null ? String(row.numbers) : (row.الأرقام || null),
-    vehicle_type: row.vehicle_type || row.vehicleType || row.النوع || null,
-    vin: row.vin || row.vinLast4 || row.الشاص || row.الهيكل || null,
-    notes: row.notes || row.سبب || row.reason || null,
-  };
+async function authorizeWatchlistDevice(body) {
+  const activationCode = String(body?.activation_code || '').trim();
+  const deviceId = String(body?.device_id || '').trim();
+  if (!activationCode || !deviceId) {
+    const error = new Error('activation_code and device_id are required.');
+    error.status = 401;
+    error.code = 'WATCHLIST_AUTH_REQUIRED';
+    throw error;
+  }
+  const { data: license, error } = await supabase
+    .from('licenses')
+    .select('*')
+    .eq('code', activationCode)
+    .maybeSingle();
+  if (error) throw error;
+  if (!license || !license.is_active || license.bound_device_id !== deviceId) {
+    const authError = new Error('The activation code is not valid for this device.');
+    authError.status = 403;
+    authError.code = 'WATCHLIST_FORBIDDEN';
+    throw authError;
+  }
+  const view = licenseStatusPayload(license, { email: license.bound_user_email || null });
+  if (view.status === 'expired') {
+    const expiredError = new Error('The activation code has expired.');
+    expiredError.status = 403;
+    expiredError.code = 'EXPIRED';
+    throw expiredError;
+  }
+  const { data: session, error: sessionError } = await supabase
+    .from('device_sessions')
+    .select('is_revoked')
+    .eq('device_id', deviceId)
+    .maybeSingle();
+  if (sessionError) throw sessionError;
+  if (session?.is_revoked) {
+    const revokedError = new Error('This device has been revoked by the administrator.');
+    revokedError.status = 403;
+    revokedError.code = 'REVOKED';
+    throw revokedError;
+  }
+  return license;
 }
 
 // ===========================================================================
@@ -812,9 +857,9 @@ app.get('/api/plates/daily', enforceKillSwitch, async (req, res) => {
   }
 });
 
-// POST /api/plates/bulk-import
-// Body: { plates: [...] } or { rows: [...] }
-// Chunked upsert into watchlist_plates so large Excel dumps finish in seconds.
+// LEGACY admin path: one-shot upsert into the live watchlist_plates table.
+// Field devices must use POST /api/watchlist/import/chunk (staging + atomic RPC).
+// Kept for the built-in admin dashboard; do not wire the mobile importer here.
 app.post('/api/plates/bulk-import', requireAdmin, async (req, res) => {
   const started = Date.now();
   try {
@@ -857,7 +902,7 @@ app.post('/api/plates/bulk-import', requireAdmin, async (req, res) => {
         ok: false,
         code: 'UPSERT_FAILED',
         message: errors[0].message,
-        hint: 'Run migrations/20260907_license_duration_and_watchlist.sql on Supabase first.',
+        hint: 'Watchlist live table is public.watchlist_plates. Field staging uses 20260910_watchlist_import_atomic.sql.',
       });
     }
 
@@ -874,6 +919,27 @@ app.post('/api/plates/bulk-import', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('[plates/bulk-import] error:', err.message);
     res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
+  }
+});
+
+// Dataset-oriented watchlist import used by field devices. Chunks are staged;
+// only the final RPC changes the active server list, in one PostgreSQL transaction.
+app.post('/api/watchlist/import/chunk', enforceKillSwitch, async (req, res) => {
+  const started = Date.now();
+  try {
+    const payload = await handleWatchlistImportChunk(req, supabase, authorizeWatchlistDevice);
+    if (payload.status === 'active') {
+      payload.elapsed_ms = Date.now() - started;
+    }
+    return res.json(payload);
+  } catch (err) {
+    console.error('[watchlist/import/chunk] error:', err.message);
+    const mapped = mapWatchlistError(err);
+    return res.status(mapped.status).json({
+      ok: false,
+      code: mapped.code,
+      message: mapped.message,
+    });
   }
 });
 
