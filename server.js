@@ -229,11 +229,12 @@ function generateLicenseCode() {
 
 async function insertLicenseRow(row) {
   let { data, error } = await supabase.from('licenses').insert(row).select().single();
-  if (error && /duration_hours|duration_months|duration_unit/i.test(error.message || '')) {
+  if (error && /duration_hours|duration_months|duration_unit|client_name/i.test(error.message || '')) {
     const {
       duration_hours: _h,
       duration_months: _m,
       duration_unit: _u,
+      client_name: _c,
       ...legacy
     } = row;
     ({ data, error } = await supabase.from('licenses').insert(legacy).select().single());
@@ -530,6 +531,93 @@ app.post('/api/location/save', enforceKillSwitch, async (req, res) => {
   }
 });
 
+// POST /api/usage/record
+// Body: { activation_code, device_id?, usage_event }
+// Idempotent insertion into voice_usage_events for paid-tier simulation aggregation.
+app.post('/api/usage/record', enforceKillSwitch, async (req, res) => {
+  try {
+    const { activation_code, device_id, usage_event } = req.body || {};
+    const code = String(activation_code || '').trim();
+    if (!code || !usage_event) {
+      return res.status(400).json({
+        ok: false,
+        code: 'BAD_REQUEST',
+        message: 'activation_code and usage_event are required.',
+      });
+    }
+
+    const { data: license, error: licError } = await supabase
+      .from('licenses')
+      .select('code, is_active, bound_device_id, expires_at')
+      .eq('code', code)
+      .maybeSingle();
+
+    if (licError) throw licError;
+    if (!license) {
+      return res.status(404).json({ ok: false, code: 'INVALID_CODE', message: 'Activation code not found.' });
+    }
+    if (!license.is_active) {
+      return res.status(403).json({ ok: false, code: 'CODE_DISABLED', message: 'Activation code is disabled.' });
+    }
+
+    const devId = device_id ? String(device_id).trim() : null;
+    if (devId && license.bound_device_id && license.bound_device_id !== devId) {
+      return res.status(403).json({ ok: false, code: 'DEVICE_MISMATCH', message: 'Device does not match license.' });
+    }
+
+    if (devId) {
+      const { data: session } = await supabase
+        .from('device_sessions')
+        .select('is_revoked')
+        .eq('device_id', devId)
+        .maybeSingle();
+      if (session?.is_revoked) {
+        return res.status(403).json({ ok: false, code: 'REVOKED', message: 'Device is revoked.' });
+      }
+    }
+
+    const eventId = String(usage_event.usage_event_id || '').trim();
+    if (!eventId) {
+      return res.status(400).json({ ok: false, code: 'BAD_REQUEST', message: 'usage_event_id is required.' });
+    }
+
+    const payload = {
+      usage_event_id: eventId,
+      license_code: code,
+      device_id: devId || usage_event.device_id || null,
+      session_id: usage_event.session_id || null,
+      model: usage_event.model || 'models/gemini-3.5-transcribe-live',
+      estimation_method: usage_event.estimation_method || 'TOKEN_USAGE',
+      session_seconds: Number(usage_event.session_seconds) || 0,
+      prompt_tokens: Number(usage_event.prompt_tokens) || 0,
+      response_tokens: Number(usage_event.response_tokens) || 0,
+      total_tokens: Number(usage_event.total_tokens) || 0,
+      audio_input_tokens: Number(usage_event.audio_input_tokens) || 0,
+      audio_output_tokens: Number(usage_event.audio_output_tokens) || 0,
+      text_input_tokens: Number(usage_event.text_input_tokens) || 0,
+      text_output_tokens: Number(usage_event.text_output_tokens) || 0,
+      estimated_usd: Number(usage_event.estimated_usd) || 0,
+      estimated_egp: Number(usage_event.estimated_egp) || 0,
+      raw_metadata: usage_event.raw_metadata || null,
+      created_at: usage_event.created_at || new Date().toISOString(),
+    };
+
+    const { error: insertError } = await supabase
+      .from('voice_usage_events')
+      .upsert(payload, { onConflict: 'usage_event_id' });
+
+    if (insertError) {
+      console.warn('[usage/record] DB note:', insertError.message);
+      return res.status(202).json({ ok: true, code: 'QUEUED', message: insertError.message });
+    }
+
+    return res.status(201).json({ ok: true, usage_event_id: eventId, recorded: true });
+  } catch (err) {
+    console.error('[usage/record] error:', err.message);
+    res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
+  }
+});
+
 // ===========================================================================
 // ADMIN ROUTES (admin + superadmin)
 // ===========================================================================
@@ -550,9 +638,10 @@ app.post('/api/admin/license/create', requireAdmin, async (req, res) => {
       }
     }
 
-    const { code } = req.body || {};
+    const { code, client_name } = req.body || {};
     const newCode = code || generateLicenseCode();
     const duration = resolveLicenseDuration(req.body || {});
+    const normalizedClientName = String(client_name || '').trim() || null;
     const row = {
       code: newCode,
       duration_days: duration.duration_days,
@@ -560,6 +649,7 @@ app.post('/api/admin/license/create', requireAdmin, async (req, res) => {
       duration_hours: duration.duration_hours,
       duration_months: duration.duration_months,
       duration_unit: duration.duration_unit,
+      client_name: normalizedClientName,
     };
     if (duration.expires_at) row.expires_at = duration.expires_at;
 
@@ -567,6 +657,27 @@ app.post('/api/admin/license/create', requireAdmin, async (req, res) => {
     res.status(201).json({ ok: true, code: 'CREATED', license: licenseStatusPayload(data) });
   } catch (err) {
     console.error('[admin/create] error:', err.message);
+    res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
+  }
+});
+
+// PATCH /api/admin/license/client-name  Body: { code, client_name } -> update optional client name
+app.patch('/api/admin/license/client-name', requireAdmin, async (req, res) => {
+  try {
+    const { code, client_name } = req.body || {};
+    if (!code) return res.status(400).json({ ok: false, code: 'BAD_REQUEST', message: 'code is required.' });
+    const normalizedName = String(client_name || '').trim() || null;
+    const { data, error } = await supabase
+      .from('licenses')
+      .update({ client_name: normalizedName })
+      .eq('code', code)
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ ok: false, code: 'NOT_FOUND', message: 'License not found.' });
+    res.json({ ok: true, code: 'UPDATED', license: licenseStatusPayload(data) });
+  } catch (err) {
+    console.error('[admin/client-name] error:', err.message);
     res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
   }
 });
@@ -675,6 +786,100 @@ app.get('/api/admin/locations', requireAdmin, async (req, res) => {
     .from('detected_locations').select('*').order('created_at', { ascending: false }).limit(1000);
   if (error) return res.status(500).json({ ok: false, message: error.message });
   res.json({ ok: true, locations: data });
+});
+
+// GET /api/admin/usage/today -> cross-device daily paid simulation usage summary.
+app.get('/api/admin/usage/today', requireAdmin, async (req, res) => {
+  try {
+    const queryDate = req.query.date || new Date().toISOString().slice(0, 10);
+    const startIso = `${queryDate}T00:00:00.000Z`;
+    const endIso = `${queryDate}T23:59:59.999Z`;
+
+    const { data: events, error: eventsError } = await supabase
+      .from('voice_usage_events')
+      .select('*')
+      .gte('created_at', startIso)
+      .lte('created_at', endIso)
+      .order('created_at', { ascending: false });
+
+    if (eventsError) {
+      return res.json({
+        ok: true,
+        date: queryDate,
+        totalUsd: 0,
+        totalEgp: 0,
+        totalSeconds: 0,
+        totalMinutes: 0,
+        totalTokens: 0,
+        users: [],
+        note: 'table_unavailable_or_empty',
+      });
+    }
+
+    const { data: licenses } = await supabase
+      .from('licenses')
+      .select('code, client_name');
+    const licenseNameMap = new Map();
+    (licenses || []).forEach((lic) => {
+      if (lic.code) licenseNameMap.set(lic.code, lic.client_name || null);
+    });
+
+    const grouped = new Map();
+    let totalUsd = 0;
+    let totalEgp = 0;
+    let totalSeconds = 0;
+    let totalTokens = 0;
+
+    for (const evt of events || []) {
+      const code = String(evt.license_code || 'anonymous').trim();
+      const current = grouped.get(code) || {
+        userCode: code,
+        clientName: licenseNameMap.get(code) || null,
+        sessions: 0,
+        seconds: 0,
+        minutes: 0,
+        tokens: 0,
+        usd: 0,
+        egp: 0,
+        estimationMethod: 'TOKEN_USAGE',
+      };
+
+      current.sessions += 1;
+      current.seconds += Number(evt.session_seconds) || 0;
+      current.tokens += Number(evt.total_tokens) || 0;
+      current.usd += Number(evt.estimated_usd) || 0;
+      current.egp += Number(evt.estimated_egp) || 0;
+      if (evt.estimation_method === 'DURATION_FALLBACK' && current.tokens === 0) {
+        current.estimationMethod = 'DURATION_FALLBACK';
+      }
+
+      totalSeconds += Number(evt.session_seconds) || 0;
+      totalTokens += Number(evt.total_tokens) || 0;
+      totalUsd += Number(evt.estimated_usd) || 0;
+      totalEgp += Number(evt.estimated_egp) || 0;
+
+      grouped.set(code, current);
+    }
+
+    const users = Array.from(grouped.values()).map((u) => ({
+      ...u,
+      minutes: u.seconds / 60,
+    })).sort((a, b) => b.usd - a.usd);
+
+    res.json({
+      ok: true,
+      date: queryDate,
+      totalUsd,
+      totalEgp,
+      totalSeconds,
+      totalMinutes: totalSeconds / 60,
+      totalTokens,
+      users,
+    });
+  } catch (err) {
+    console.error('[admin/usage/today] error:', err.message);
+    res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: err.message });
+  }
 });
 
 // ===========================================================================
